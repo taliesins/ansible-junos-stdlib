@@ -1,0 +1,183 @@
+#!/usr/bin/env python
+
+# Copyright (c) 1999-2017, Interxion.
+#               2017, Taliesin Sisson & Ravindrakumar Solanki
+#
+# All rights reserved.
+#
+# License: Apache 2.0
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in the
+#   documentation and/or other materials provided with the distribution.
+#
+# * Neither the name of the Juniper Networks nor the
+#   names of its contributors may be used to endorse or promote products
+#   derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY Juniper Networks, Inc. ''AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL Juniper Networks, Inc. BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+DOCUMENTATION = '''
+---
+module: junos_space_discover_device
+author: Taliesin Sisson & Ravindrakumar Solanki, Interxion
+version_added: "1.0.0"
+short_description: Retrieve devices from Space.
+description:
+    - Discover device with Space.
+requirements:
+    - space-ez
+options:
+    uri:
+        description:
+            - Set to space uri
+        required: true
+    user:
+        description:
+            - Space login username
+        required: false
+        default: $USER
+    passwd:
+        description:
+            - Space login password
+        required: true
+    device_ip:
+        description:
+            - Ip address of device to discover in Space
+        required: true
+    device_user:
+        description:
+            - Username of device to discover in Space
+        required: true
+    device_passwd:
+        description:
+            - Password of device to discover in Space
+        required: true
+    savedir:
+        description:
+            - Path to the local server directory where device fact
+              files will be stored. Resulting file will be
+              I(savedir/hostname-facts.json)
+        required: false
+        default: $CWD
+    logfile:
+        description:
+            - Path on the local server where the progress status is logged
+              for debugging purposes. This option is used only with the
+              I(console) option.
+        required: false
+        default: None
+'''
+
+EXAMPLES = '''
+# retrieve devices
+# space login, with default password
+
+- junos_space_discover_device:
+    uri=https://space.example.com/
+    user=super
+    pwd=abc123
+    device_ip=192.168.50.71
+    device_user=admin
+    device_passwd=abc123
+    savedir=/usr/local/junos/inventory
+  register: spaceos
+
+# access the facts
+
+- name: devices
+  debug: msg="{{ spaceos }}"
+
+'''
+
+import os
+import json
+from distutils.version import LooseVersion
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            uri=dict(required=True),
+            logfile=dict(required=False, default=None),
+            savedir=dict(required=False, default=None),
+            user=dict(required=False, default=os.getenv('USER')),
+            passwd=dict(required=True, no_log=True),
+            device_ip=dict(required=True),
+            device_user=dict(required=True),
+            device_passwd=dict(required=True, no_log=True)),
+        supports_check_mode=True)
+
+    m_args = module.params
+    m_results = dict(changed=False)
+
+    try:
+        from jnpr.space import rest, async
+    except ImportError as ex:
+        module.fail_json(msg='ImportError: %s' % ex.message)
+
+    import logging
+
+    logfile = m_args['logfile']
+    if logfile is not None:
+        logging.basicConfig(filename=logfile, level=logging.INFO, format='%(asctime)s:%(name)s:%(message)s')
+        logging.getLogger().name = 'SPACE:' + module.params['uri']
+
+        def log_notify(self, event, message):
+            logging.info("%s:%s" % (event, message))
+        use_notifier = log_notify
+    else:
+        def silent_notify(self, event, message):
+            pass
+        use_notifier = silent_notify
+
+    try:
+        spc = rest.Space(m_args['uri'], m_args['user'], m_args['passwd'])
+
+        task_monitor = async.TaskMonitor(spc, 'ansible-device-discovery', wait_time='2')
+        try:
+            job = spc.device_management.discover_devices.post(
+                task_monitor=task_monitor,
+                accept='application/vnd.net.juniper.space.job-management.task+xml;version=1',
+                ipAddress=m_args['device_ip'],
+                manageDiscoveredSystemsFlag=True,
+                usePing=True,
+                userName=m_args['device_user'],
+                password=m_args['device_passwd'])
+
+            job_result = task_monitor.wait_for_task(job.id)
+            job_result_dto = dict(state=str(job_result.state), status=str(job_result.status))
+        finally:
+            task_monitor.delete()
+
+    except Exception as err:
+        msg = 'unable to connect to {0}: {1}'.format(m_args['uri'], str(err))
+        module.fail_json(msg=msg)
+        return
+
+    if m_args['savedir'] is not None:
+        fname = "{0}/space-{1}-device-{2}.json".format(m_args['savedir'], m_args['uri'], m_args['uri'], m_args['device_ip'])
+        with open(fname, 'w') as factfile:
+            json.dump(job_result_dto, factfile)
+
+    m_results['args'] = m_args
+    m_results['facts'] = json.dumps(job_result_dto)
+
+    module.exit_json(**m_results)
+
+from ansible.module_utils.basic import *
+main()
